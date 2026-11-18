@@ -20,7 +20,9 @@ def sign(db,key,u):
     if not c.active or not p.isolation or p.wind_mps>10:raise HTTPException(409,'班组须启用，完成电气隔离且阵风不得超过10m/s')
     # Crew row serializes capacity changes; READ COMMITTED observes the preceding signer.
     occupied=db.scalar(select(func.coalesce(func.sum(WorkPermit.minutes),0)).where(WorkPermit.crew_id==c.id,WorkPermit.work_date==p.work_date,WorkPermit.state.in_(['signed','used'])))
-    if occupied+p.minutes>c.max_daily_minutes:raise HTTPException(409,'班组当日工时容量不足')
+    from .trial_service import held_crew_minutes
+    trial_held=held_crew_minutes(db,c.id,p.work_date)
+    if occupied+trial_held+p.minutes>c.max_daily_minutes:raise HTTPException(409,'班组当日工时容量不足（含节水试验整组预留），普通派工不能抢占试验工时')
     p.state='signed';p.signed_by=u.email;audit(db,u,f'签发许可{key} 占用{p.minutes}分钟');db.commit();return p
 
 def void(db,key,u):

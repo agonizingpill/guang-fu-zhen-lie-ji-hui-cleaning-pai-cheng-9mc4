@@ -10,6 +10,8 @@ def prepare(db,body,user):
     if survey.predicted_loss is None or survey.predicted_loss<=0:raise HTTPException(409,'未发现积灰功率损失，不应安排清洗')
     block=require(db,ArrayBlock,survey.block_id)
     if db.scalar(select(WashMission).where(WashMission.survey_id==survey.id)):raise HTTPException(409,'该巡测已有清洗任务，请修订原计划')
+    from .trial_service import held_arm_for_survey
+    if held_arm_for_survey(db,survey.id):raise HTTPException(409,'该巡测属于已批准节水试验分组，不能另编普通清洗计划；紧急运维请先在试验页让配对退出比较')
     mission=WashMission(survey_id=survey.id,water_liters=body.water_liters,available_liters=block.water_liters)
     db.add(mission);audit(db,user,f'编制清洗计划 巡测{survey.id} 用水{body.water_liters}L');db.commit();return mission
 
@@ -30,8 +32,10 @@ def dispatch(db,key,user):
     if block.cleaning_state=='washing':raise HTTPException(409,'同阵列已有执行中的清洗任务')
     if mission.water_liters>mission.available_liters or mission.water_liters>block.water_liters:raise HTTPException(409,'计划用水超过阵列配额/水车余量，请修订水量后派工')
     from .permit_service import dispatch_guard
+    from .trial_service import guard_normal_dispatch
+    # 普通派工不得抢占已批准节水试验预留的水额、工时与分组（先于许可校验给出明确口径）
+    guard_normal_dispatch(db,mission)
     dispatch_guard(db,mission)
-    # Lock the source budget and its dependent mission in one transaction.
     mission.available_liters=block.water_liters
     block.water_liters=round(block.water_liters-mission.water_liters,3);block.cleaning_state='washing'
     mission.status='dispatched';mission.dispatched_at=datetime.utcnow();survey.state='scheduled'
@@ -61,4 +65,8 @@ def accept(db,key,user):
         reading.state='stale'
         draft=db.scalar(select(WashMission).where(WashMission.survey_id==reading.id,WashMission.status=='draft'))
         if draft:draft.status='superseded'
-    audit(db,user,f'清洗任务 {key} 验收，实测增益{mission.verified_gain:.3f}kW');db.commit();return mission
+    audit(db,user,f'清洗任务 {key} 验收，实测增益{mission.verified_gain:.3f}kW')
+    # 若该任务属于节水试验分组，回写校正后观测并在整组完成时形成结论
+    from . import trial_service
+    trial_service.on_mission_accepted(db,mission)
+    db.commit();return mission
